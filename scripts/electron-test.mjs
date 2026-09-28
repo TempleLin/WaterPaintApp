@@ -12,12 +12,15 @@ try {
   delete launchEnv.ELECTRON_RUN_AS_NODE
   app = await electron.launch({ args: ['.'], env: launchEnv, timeout: 90000 })
   const page = await app.firstWindow()
+  await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].webContents.setBackgroundThrottling(false))
+  page.setDefaultTimeout(30000)
   const errors = []
   page.on('pageerror', error => errors.push(error.message))
   page.on('console', message => { if (message.type() === 'error') console.log('Renderer:', message.text()) })
   await page.waitForFunction(() => window.__waterpaint?.state.ready || window.__waterpaint?.state.error, { timeout: 90000 })
   const initial = await page.evaluate(() => ({ ready: window.__waterpaint.state.ready, error: window.__waterpaint.state.error, gpu: window.__waterpaint.engine.gpuName }))
   check('WebGPU initialized with valid shaders', initial.ready && !initial.error, initial)
+  await page.evaluate(async () => { await window.__waterpaint.recoveryAction(false) })
   report.metrics.gpu = initial.gpu
   report.metrics.hardware = await app.evaluate(async ({ app }) => {
     const gpu = await app.getGPUInfo('complete')
@@ -144,6 +147,65 @@ try {
   await page.getByRole('button', { name: 'Import image', exact: true }).click()
   await page.waitForFunction(() => !window.__waterpaint.state.busy && window.__waterpaint.state.layers.length === 2)
   check('Native image import and placement create a raster layer', await page.evaluate(() => window.__waterpaint.state.layers.at(-1).kind === 'raster'))
+  await page.getByTestId('image-transform-box').waitFor()
+  check('Imported source uploads without GPU validation errors', await page.evaluate(() => !window.__waterpaint.state.error))
+  const imported = await page.evaluate(async () => {
+    const s = window.__waterpaint; s.engine.paused = true
+    window.__importSnapshot = await s.engine.snapshot('Imported', s.state.activeId)
+    return s.state.layers.at(-1).transform
+  })
+  const handle = await page.getByRole('button', { name: 'Resize image se', exact: true }).boundingBox()
+  await page.mouse.move(handle.x + handle.width / 2, handle.y + handle.height / 2)
+  await page.mouse.down(); await page.mouse.move(handle.x + handle.width / 2 + 32, handle.y + handle.height / 2 + 24, { steps: 8 }); await page.mouse.up()
+  await page.waitForFunction(() => !window.__waterpaint.state.busy)
+  const resized = await page.evaluate(() => window.__waterpaint.state.layers.at(-1).transform)
+  check('Bounding handles resize proportionally around the opposite corner', resized.width > imported.width && Math.abs(resized.width / resized.height - imported.width / imported.height) < .001 && Math.abs((resized.x - resized.width / 2) - (imported.x - imported.width / 2)) < .001, { imported, resized })
+  await page.getByRole('button', { name: 'Rotate image right 90°', exact: true }).click()
+  await page.waitForFunction(() => !window.__waterpaint.state.busy)
+  await page.getByRole('button', { name: 'Flip image horizontally', exact: true }).click()
+  await page.waitForFunction(() => !window.__waterpaint.state.busy)
+  const transformed = await page.evaluate(async () => {
+    const s = window.__waterpaint, snapshot = await s.engine.snapshot('Transformed', s.state.activeId), original = window.__importSnapshot
+    return { transform: snapshot.layers[1].meta.transform, sameSource: original.layers[1].raster.every((v, i) => v === snapshot.layers[1].raster[i]), paintUnchanged: original.layers[0].state.every((v, i) => v === snapshot.layers[0].state[i]) }
+  })
+  check('Rotation and flip preserve source pixels and watercolor layers', transformed.transform.rotation === 90 && transformed.transform.flipX && transformed.sameSource && transformed.paintUnchanged, transformed)
+  await page.screenshot({ path: 'test-results/image-editing.png' })
+  await page.evaluate(async () => {
+    const s = window.__waterpaint; await s.travel(false); await s.travel(true)
+  })
+  check('Image transforms survive undo and redo', await page.evaluate(() => window.__waterpaint.state.layers.at(-1).transform.flipX))
+  const moving = await page.getByTestId('image-transform-box').boundingBox()
+  await page.mouse.move(moving.x + moving.width / 2, moving.y + moving.height / 2); await page.mouse.down()
+  await page.mouse.move(moving.x + moving.width / 2 + 25, moving.y + moving.height / 2 + 16, { steps: 6 })
+  await page.keyboard.press('Escape'); await page.mouse.up()
+  check('Escape cancels a live image drag', await page.evaluate(t => JSON.stringify(window.__waterpaint.state.layers.at(-1).transform) === JSON.stringify(t), transformed.transform))
+
+  await page.getByRole('button', { name: 'Paint over image', exact: true }).click()
+  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))
+  const afterImportCanvas = await canvas.boundingBox()
+  await page.mouse.move(afterImportCanvas.x + afterImportCanvas.width * .25, afterImportCanvas.y + afterImportCanvas.height * .25)
+  await page.mouse.down(); await page.mouse.move(afterImportCanvas.x + afterImportCanvas.width * .7, afterImportCanvas.y + afterImportCanvas.height * .3, { steps: 12 }); await page.mouse.up()
+  await page.waitForFunction(() => !window.__waterpaint.state.busy)
+  const afterImportPaint = await page.evaluate(async () => {
+    const s = window.__waterpaint; s.engine.paused = true
+    const before = await s.engine.snapshot('After import painting', s.state.activeId)
+    await s.travel(false); const undone = s.state.layers.length
+    await s.travel(true); const restored = await s.engine.snapshot('Redo', s.state.activeId)
+    return { count: before.layers.length, painted: before.layers[2]?.meta.kind === 'paint' && before.layers[2].state.length > 0, imageIntact: before.layers[1].raster.every((v,i) => v === window.__importSnapshot.layers[1].raster[i]), undone, exact: before.layers[2]?.state.every((v,i) => v === restored.layers[2].state[i]) }
+  })
+  check('Drawing after import creates an undoable watercolor layer above the intact image', afterImportPaint.count === 3 && afterImportPaint.painted && afterImportPaint.imageIntact && afterImportPaint.undone === 2 && afterImportPaint.exact, afterImportPaint)
+  await page.keyboard.press('i')
+  await page.mouse.move(afterImportCanvas.x + afterImportCanvas.width * .45, afterImportCanvas.y + afterImportCanvas.height * .28)
+  await page.waitForFunction(() => /#[0-9A-F]{6}/.test(document.querySelector('[data-testid="color-loupe"]')?.getAttribute('aria-label') ?? ''))
+  await page.screenshot({ path: 'test-results/color-magnifier.png' })
+  const magnified = await page.getByTestId('color-loupe').getAttribute('aria-label')
+  await page.mouse.click(afterImportCanvas.x + afterImportCanvas.width * .45, afterImportCanvas.y + afterImportCanvas.height * .28)
+  await page.waitForFunction(() => window.__waterpaint.state.brush.tool === 'brush')
+  check('Eyedropper magnifies the sampled pixel and applies the displayed color', await page.evaluate(label => label.endsWith(window.__waterpaint.state.brush.color.toUpperCase()), magnified), { magnified })
+  await page.keyboard.down('Alt')
+  await page.getByTestId('color-loupe').waitFor()
+  await page.keyboard.up('Alt')
+  check('Alt temporarily shows the color magnifier', await page.getByTestId('color-loupe').count() === 0)
   const rasterRoundTrip = await page.evaluate(async () => {
     const s = window.__waterpaint, before = await s.engine.pixels(false), data = await s.bytes()
     await s.loadBytes(data, true)
@@ -151,6 +213,27 @@ try {
     return before.every((v,i) => v === after[i])
   })
   check('Raster and watercolor layers survive project round trip', rasterRoundTrip)
+  const imageLayers = await page.evaluate(async () => {
+    const s = window.__waterpaint, e = s.engine, id = s.state.layers.find(l => l.kind === 'raster').id
+    const original = s.state.layers.find(l => l.id === id).transform, pixels = await e.pixels(false)
+    await s.updateLayer(id, { locked: true }); await s.transformRaster(id, { ...original, x: original.x + 50 })
+    const locked = JSON.stringify(s.state.layers.find(l => l.id === id).transform) === JSON.stringify(original)
+    await s.updateLayer(id, { locked: false, visible: false })
+    const hiddenPixels = await e.pixels(false), hidden = hiddenPixels.some((v, i) => v !== pixels[i])
+    await s.updateLayer(id, { visible: true, opacity: .3 })
+    const faded = await e.pixels(false), opacity = faded.some((v, i) => v !== pixels[i])
+    await s.updateLayer(id, { opacity: 1 }); await s.duplicateLayer(id)
+    const copy = s.state.activeId
+    await s.transformRaster(copy, { ...original, rotation: -35 })
+    const independent = JSON.stringify(s.state.layers.find(l => l.id === id).transform) === JSON.stringify(original)
+    await s.reorderLayer(copy, -1)
+    const reordered = s.state.layers.at(-2).id === copy
+    await s.deleteLayer(copy)
+    s.selectLayer(id); s.selectTool('image-transform'); await s.addLayer()
+    const canPaint = s.state.brush.tool === 'brush' && s.state.layers.find(l => l.id === s.state.activeId).kind === 'paint'
+    return { locked, hidden, opacity, independent, reordered, canPaint }
+  })
+  check('Image edits respect layer locks, visibility, opacity, duplication, and order; new layers select the brush', Object.values(imageLayers).every(Boolean), imageLayers)
   await app.evaluate(({ dialog }, target) => { dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [target] }) }, projectPath)
   await page.evaluate(async () => { await window.__waterpaint.newDocument(64,64); await window.__waterpaint.open() })
   check('Native open restores dimensions and paint', await page.evaluate(() => window.__waterpaint.engine.width === 512 && window.__waterpaint.state.layers.length === 1))
@@ -165,6 +248,33 @@ try {
   check('Malformed project leaves the current painting intact', malformed)
   const recovery = await page.evaluate(async () => { const data = await window.__waterpaint.bytes(); await window.desktop.writeRecovery(data); const saved = await window.desktop.readRecovery(); return data.length === saved.length && data.every((v,i) => v === saved[i]) })
   check('Recovery preserves the complete document', recovery)
+
+  const spreadResult = await page.evaluate(async () => {
+    const s = window.__waterpaint, e = s.engine, measurements = []
+    for (const spread of [1, 4, 8]) {
+      await s.newDocument(256, 256); e.paused = true; e.seed = 12763
+      const id = s.state.activeId, brush = { ...s.state.brush, tool: 'brush', size: 26, water: 1, pigment: .7, spread }
+      for (let n = 0; n < 8; n++) e.dab(id, { x: 128, y: 128, pressure: 1 }, brush)
+      const metrics = snapshot => {
+        const l = snapshot.layers[0], values = new Float32Array(l.state.buffer)
+        let mass = 0, moment = 0, water = 0
+        for (let i = 0; i < values.length; i += 20) {
+          const pigment = values[i + 17] + values[i + 18], cell = i / 20
+          const x = l.bounds.x + cell % l.bounds.width + .5, y = l.bounds.y + Math.floor(cell / l.bounds.width) + .5
+          mass += pigment; moment += pigment * ((x - 128) ** 2 + (y - 128) ** 2); water += values[i + 16]
+        }
+        return { mass, radius: Math.sqrt(moment / mass), water, valid: values.every(v => Number.isFinite(v) && v >= 0) }
+      }
+      const before = metrics(await e.snapshot('Before', id)); e.step(480)
+      const after = metrics(await e.snapshot('After', id))
+      const data = await s.bytes(); await s.loadBytes(data, true)
+      const restored = await e.snapshot('Restored', s.state.activeId)
+      measurements.push({ spread, before, after, savedSpread: restored.layers[0].spread, massError: Math.abs(after.mass - before.mass) / before.mass })
+    }
+    return measurements
+  })
+  check('Stronger spread transports pigment farther while conserving mass and saving the rate', spreadResult.every(m => m.after.valid && m.massError < .005 && m.savedSpread === m.spread) && spreadResult[1].after.radius > spreadResult[0].after.radius && spreadResult[2].after.radius > spreadResult[1].after.radius, spreadResult)
+  report.metrics.spread = spreadResult
 
   // Maximum document size benchmark, with one localized wet wash.
   const performanceResult = await page.evaluate(async () => {

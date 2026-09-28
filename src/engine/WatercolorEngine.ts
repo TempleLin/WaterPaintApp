@@ -1,4 +1,4 @@
-import type { BrushSample, BrushSettings, DocumentSnapshot, LayerMeta, LayerSnapshot, Rect } from '../shared/types'
+import type { BrushSample, BrushSettings, DocumentSnapshot, LayerMeta, LayerSnapshot, RasterTransform, Rect } from '../shared/types'
 import { MAX_LAYERS, MAX_SIZE } from '../shared/types'
 import { pigmentKS } from './spectral'
 import { computeShader, rasterShader, renderShader } from './shaders'
@@ -17,7 +17,7 @@ function union(a: Rect | null, b: Rect): Rect {
 interface PaintLayer {
   meta: LayerMeta; buffer: GPUBuffer; uniform: GPUBuffer; texture: GPUTexture;
   renderGroup: GPUBindGroup; compositeGroup: GPUBindGroup; computeGroup: GPUBindGroup;
-  bounds: Rect | null; wetUntil: number; dirty: boolean; raster?: Uint8Array
+  bounds: Rect | null; wetUntil: number; spread: number; dirty: boolean; raster?: Uint8Array; preview?: RasterTransform
 }
 export interface EngineStats { fps: number; frameMs: number; wetLayers: number; gpu: string; simulation: string }
 
@@ -117,7 +117,7 @@ export class WatercolorEngine {
     this.accumulator = 0; this.needsRender = true
   }
   private get byteSize(): number { return this.gridWidth * this.gridHeight * CELL_BYTES }
-  get metadata(): LayerMeta[] { return this.layers.map(l => ({ ...l.meta })) }
+  get metadata(): LayerMeta[] { return this.layers.map(l => structuredClone(l.meta)) }
   get hasArtwork(): boolean { return this.layers.some(l => l.bounds !== null || !!l.raster) }
   get wetCount(): number { return this.layers.filter(l => l.wetUntil > this.tick).length }
   get busy(): boolean { return this.held > 0 }
@@ -130,11 +130,10 @@ export class WatercolorEngine {
     const uniform = this.device.createBuffer({ size: 112, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST })
     const texture = this.device.createTexture({ size: [this.width, this.height], format: 'rgba8unorm', usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST })
     const renderGroup = this.device.createBindGroup({ layout: this.paintLayout, entries: [ { binding: 0, resource: { buffer } }, { binding: 1, resource: { buffer: uniform } } ] })
-    // Composite opacity occupies the first float of a dedicated buffer; the
-    // remaining render parameters are at byte 16 to avoid aliasing uniforms.
-    const compositeGroup = this.device.createBindGroup({ layout: this.compositeLayout, entries: [ { binding: 0, resource: texture.createView() }, { binding: 1, resource: this.sampler }, { binding: 2, resource: { buffer: uniform, offset: 0, size: 16 } } ] })
+    // Paint and composite passes submit separately before reusing this uniform.
+    const compositeGroup = this.compositeGroup(texture, uniform)
     const computeGroup = this.device.createBindGroup({ layout: this.computeLayout, entries: [ { binding: 0, resource: { buffer } }, { binding: 1, resource: { buffer: this.scratch } }, { binding: 2, resource: { buffer: this.computeUniform } } ] })
-    this.layers.push({ meta: layerMeta, buffer, uniform, texture, renderGroup, compositeGroup, computeGroup, bounds: null, wetUntil: 0, dirty: true })
+    this.layers.push({ meta: layerMeta, buffer, uniform, texture, renderGroup, compositeGroup, computeGroup, bounds: null, wetUntil: 0, spread: 1, dirty: true })
     this.needsRender = true
     return { ...layerMeta }
   }
@@ -142,6 +141,16 @@ export class WatercolorEngine {
     const layer = this.layers.find(l => l.meta.id === id)
     if (!layer) throw new Error('The selected layer no longer exists.')
     return layer
+  }
+  private compositeGroup(texture: GPUTexture, uniform: GPUBuffer): GPUBindGroup {
+    return this.device.createBindGroup({ layout: this.compositeLayout, entries: [
+      { binding: 0, resource: texture.createView() }, { binding: 1, resource: this.sampler },
+      { binding: 2, resource: { buffer: uniform, offset: 0, size: 48 } }
+    ] })
+  }
+  previewRaster(id: string, transform?: RasterTransform): void {
+    const l = this.layers.find(l => l.meta.id === id)
+    if (l) { l.preview = transform; this.needsRender = true }
   }
   updateLayer(id: string, update: Partial<Omit<LayerMeta, 'id' | 'kind'>>): void {
     Object.assign(this.layer(id).meta, update); this.needsRender = true
@@ -157,7 +166,7 @@ export class WatercolorEngine {
   }
   private destroyLayer(l: PaintLayer): void { l.buffer.destroy(); l.uniform.destroy(); l.texture.destroy() }
 
-  private params(bounds: Rect, mode = 0, sample?: BrushSample, settings?: BrushSettings, dt = 1 / 60): ArrayBuffer {
+  private params(bounds: Rect, mode = 0, sample?: BrushSample, settings?: BrushSettings, dt = 1 / 60, spread = 1): ArrayBuffer {
     const data = new ArrayBuffer(112), u = new Uint32Array(data), f = new Float32Array(data)
     u.set([this.gridWidth, this.gridHeight, bounds.x, bounds.y, bounds.width, bounds.height, mode, this.seed])
     if (sample && settings) {
@@ -166,6 +175,7 @@ export class WatercolorEngine {
       f.set(pigmentKS(settings.color), 16)
     }
     f.set([dt, 1, this.width, this.height], 24)
+    if (!settings) f[12] = spread
     return data
   }
   private region(x: number, y: number, radius: number): Rect {
@@ -178,7 +188,9 @@ export class WatercolorEngine {
     const scale = this.gridWidth / this.width, x = sample.x * scale, y = sample.y * scale, radius = settings.size * .5 * scale + 2
     const bounds = this.region(x, y, radius)
     if (!bounds.width || !bounds.height) return
-    l.bounds = union(l.bounds, this.region(x, y, radius + 36))
+    l.spread = Math.max(1, Math.min(8, settings.spread ?? 1))
+    // Reserve enough paper for the longer diffusion distance (proportional to sqrt(D)).
+    l.bounds = union(l.bounds, this.region(x, y, radius + Math.ceil(36 * Math.sqrt(l.spread))))
     const mode = settings.tool === 'water' ? 1 : settings.tool === 'lift' ? 2 : settings.tool === 'eraser' ? 3 : 0
     this.device.queue.writeBuffer(this.computeUniform, 0, this.params(bounds, mode, sample, settings))
     this.dispatch(l, bounds, ['deposit'])
@@ -204,8 +216,12 @@ export class WatercolorEngine {
       this.tick++
       for (const l of this.layers) {
         if (l.meta.kind !== 'paint' || !l.bounds || l.wetUntil < this.tick) continue
-        this.device.queue.writeBuffer(this.computeUniform, 0, this.params(l.bounds))
-        this.dispatch(l, l.bounds, this.tick === l.wetUntil ? ['dry'] : ['simulate', 'commit'])
+        // Substeps keep the combined advection/diffusion flux below the CFL limit.
+        // Only transport speeds up; evaporation and settling keep real elapsed time.
+        const substeps = Math.ceil(l.spread)
+        this.device.queue.writeBuffer(this.computeUniform, 0, this.params(l.bounds, 0, undefined, undefined, 1 / (60 * substeps), l.spread))
+        if (this.tick === l.wetUntil) this.dispatch(l, l.bounds, ['dry'])
+        else this.dispatch(l, l.bounds, Array.from({ length: substeps }, () => ['simulate', 'commit'] as const).flat())
         l.dirty = true; this.needsRender = true
       }
     }
@@ -249,7 +265,15 @@ export class WatercolorEngine {
     background.end(); this.device.queue.submit([encoder.finish()])
     for (const l of this.layers) {
       if (!l.meta.visible) continue
-      this.device.queue.writeBuffer(l.uniform, 0, new Float32Array([l.meta.opacity, l.meta.kind === 'paint' ? 1 : 0, 0, 0]))
+      const t = l.preview ?? l.meta.transform
+      const matrix = [1, 0, 0, 0, 0, 1, 0, 0]
+      if (l.meta.kind === 'raster' && t) {
+        const a = t.rotation * Math.PI / 180, c = Math.cos(a), s = Math.sin(a)
+        const sx = (t.flipX ? -1 : 1) / t.width, sy = (t.flipY ? -1 : 1) / t.height
+        matrix.splice(0, 8, c * this.width * sx, s * this.height * sx, .5 - (c * t.x + s * t.y) * sx, 0,
+          -s * this.width * sy, c * this.height * sy, .5 + (s * t.x - c * t.y) * sy, 0)
+      }
+      this.device.queue.writeBuffer(l.uniform, 0, new Float32Array([l.meta.opacity, l.meta.kind === 'paint' ? 1 : 0, 0, 0, ...matrix]))
     }
     const e = this.device.createCommandEncoder(), pass = e.beginRenderPass({ colorAttachments: [{ view, loadOp: 'load', storeOp: 'store' }] })
     pass.setPipeline(this.compositePipeline)
@@ -272,7 +296,7 @@ export class WatercolorEngine {
           this.device.queue.submit([encoder.finish()]); await read.mapAsync(GPUMapMode.READ)
           state = new Uint8Array(read.getMappedRange().slice(0)); read.unmap(); read.destroy()
         }
-        layers.push({ meta: { ...l.meta }, bounds: l.bounds ? { ...l.bounds } : null, wetUntil: l.wetUntil, state, raster: l.raster?.slice() })
+        layers.push({ meta: structuredClone(l.meta), bounds: l.bounds ? { ...l.bounds } : null, wetUntil: l.wetUntil, spread: l.spread, state, raster: l.raster?.slice() })
       }
       return { version: 1, width: this.width, height: this.height, seed: this.seed, tick: this.tick, title, activeId, layers }
     } finally { release() }
@@ -283,7 +307,7 @@ export class WatercolorEngine {
       this.reset(snapshot.width, snapshot.height, snapshot.seed); this.tick = snapshot.tick
       for (const saved of snapshot.layers) {
         this.addLayer(saved.meta)
-        const l = this.layer(saved.meta.id); l.bounds = saved.bounds; l.wetUntil = saved.wetUntil
+        const l = this.layer(saved.meta.id); l.bounds = saved.bounds; l.wetUntil = saved.wetUntil; l.spread = saved.spread ?? 1
         if (saved.bounds && saved.meta.kind === 'paint') {
           const b = saved.bounds, rowBytes = b.width * CELL_BYTES
           for (let y = 0; y < b.height; y++) this.device.queue.writeBuffer(l.buffer, ((b.y + y) * this.gridWidth + b.x) * CELL_BYTES, saved.state.slice(y * rowBytes, (y + 1) * rowBytes))
@@ -295,8 +319,14 @@ export class WatercolorEngine {
   }
   async setRaster(id: string, png: Uint8Array): Promise<void> {
     const l = this.layer(id), bitmap = await createImageBitmap(new Blob([png.slice().buffer as ArrayBuffer], { type: 'image/png' }))
-    this.device.queue.copyExternalImageToTexture({ source: bitmap }, { texture: l.texture }, [this.width, this.height])
-    bitmap.close(); l.raster = png.slice(); l.dirty = false; this.needsRender = true
+    try {
+      if (bitmap.width > MAX_SIZE || bitmap.height > MAX_SIZE) throw new Error('Image dimensions exceed 2048 pixels.')
+      const texture = this.device.createTexture({ size: [bitmap.width, bitmap.height], format: 'rgba8unorm', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT })
+      this.device.queue.copyExternalImageToTexture({ source: bitmap }, { texture }, [bitmap.width, bitmap.height])
+      l.texture.destroy(); l.texture = texture; l.compositeGroup = this.compositeGroup(texture, l.uniform)
+      l.meta.transform ??= { x: this.width / 2, y: this.height / 2, width: this.width, height: this.height, rotation: 0, flipX: false, flipY: false }
+      l.raster = png.slice(); l.dirty = false; this.needsRender = true
+    } finally { bitmap.close() }
   }
   async duplicate(id: string): Promise<LayerMeta> {
     const l = this.layer(id), meta = this.addLayer({ ...l.meta, id: crypto.randomUUID(), name: `${l.meta.name} copy` })
@@ -304,24 +334,25 @@ export class WatercolorEngine {
     if (l.meta.kind === 'paint') {
       const e = this.device.createCommandEncoder(); e.copyBufferToBuffer(l.buffer, 0, copy.buffer, 0, this.byteSize); this.device.queue.submit([e.finish()])
     } else if (l.raster) await this.setRaster(meta.id, l.raster)
-    copy.bounds = l.bounds ? { ...l.bounds } : null; copy.wetUntil = l.wetUntil; copy.dirty = l.meta.kind === 'paint'
+    copy.meta = structuredClone(copy.meta)
+    copy.bounds = l.bounds ? { ...l.bounds } : null; copy.wetUntil = l.wetUntil; copy.spread = l.spread; copy.dirty = l.meta.kind === 'paint'
     return meta
   }
-  async pixels(paper: boolean): Promise<Uint8ClampedArray<ArrayBuffer>> {
+  async pixels(paper: boolean, region: Rect = { x: 0, y: 0, width: this.width, height: this.height }): Promise<Uint8ClampedArray<ArrayBuffer>> {
     const release = this.hold()
     try {
       const texture = this.device.createTexture({ size: [this.width, this.height], format: this.format, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC })
       this.render(texture.createView(), paper)
-      const stride = Math.ceil(this.width * 4 / 256) * 256
-      const read = this.device.createBuffer({ size: stride * this.height, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ })
+      const { width, height } = region, stride = Math.ceil(width * 4 / 256) * 256
+      const read = this.device.createBuffer({ size: stride * height, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ })
       const encoder = this.device.createCommandEncoder()
-      encoder.copyTextureToBuffer({ texture }, { buffer: read, bytesPerRow: stride }, [this.width, this.height])
+      encoder.copyTextureToBuffer({ texture, origin: [region.x, region.y] }, { buffer: read, bytesPerRow: stride }, [width, height])
       this.device.queue.submit([encoder.finish()]); await read.mapAsync(GPUMapMode.READ)
-      const bytes = new Uint8Array(read.getMappedRange()), output = new Uint8ClampedArray(this.width * this.height * 4)
+      const bytes = new Uint8Array(read.getMappedRange()), output = new Uint8ClampedArray(width * height * 4)
       const bgra = this.format.startsWith('bgra')
-      for (let y = 0; y < this.height; y++) {
-        for (let x = 0; x < this.width; x++) {
-          const s = y * stride + x * 4, d = (y * this.width + x) * 4, a = bytes[s + 3]
+      for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++) {
+          const s = y * stride + x * 4, d = (y * width + x) * 4, a = bytes[s + 3]
           // Render targets contain premultiplied RGB; PNG needs straight alpha.
           output[d] = a ? Math.min(255, bytes[s + (bgra ? 2 : 0)] * 255 / a) : 0
           output[d + 1] = a ? Math.min(255, bytes[s + 1] * 255 / a) : 0
@@ -339,8 +370,8 @@ export class WatercolorEngine {
     return new Uint8Array(await (await canvas.convertToBlob({ type: 'image/png' })).arrayBuffer())
   }
   async sampleColor(x: number, y: number): Promise<string> {
-    const pixels = await this.pixels(true), i = (Math.max(0, Math.min(this.height - 1, Math.floor(y))) * this.width + Math.max(0, Math.min(this.width - 1, Math.floor(x)))) * 4
-    return '#' + Array.from(pixels.slice(i, i + 3)).map(n => n.toString(16).padStart(2, '0')).join('')
+    const pixels = await this.pixels(true, { x: Math.max(0, Math.min(this.width - 1, Math.floor(x))), y: Math.max(0, Math.min(this.height - 1, Math.floor(y))), width: 1, height: 1 })
+    return '#' + Array.from(pixels.slice(0, 3)).map(n => n.toString(16).padStart(2, '0')).join('')
   }
   async settled(): Promise<void> { await this.device.queue.onSubmittedWorkDone() }
   stop(): void { cancelAnimationFrame(this.frame) }

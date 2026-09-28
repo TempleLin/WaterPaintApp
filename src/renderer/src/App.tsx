@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
-import { ArrowDown, ArrowUp, Brush, Check, ChevronDown, CircleHelp, Copy, Download, Droplets, Eraser, Expand, Eye, EyeOff, FilePlus2, FolderOpen, Hand, ImagePlus, Layers, Leaf, LockKeyhole, Minus, MoreHorizontal, Pause, Pipette, Play, Plus, RotateCcw, Save, Sparkles, Sun, Trash2, Undo2, Redo2, UnlockKeyhole, X } from 'lucide-react'
+import { ArrowDown, ArrowUp, Brush, Check, ChevronDown, CircleHelp, Copy, Download, Droplets, Eraser, Expand, Eye, EyeOff, FilePlus2, Hand, ImagePlus, Layers, Leaf, LockKeyhole, Minus, Move, Pause, Pipette, Play, Plus, RotateCcw, RotateCw, Save, Scaling, Sparkles, Sun, Trash2, Undo2, Redo2, UnlockKeyhole, X } from 'lucide-react'
 import { Studio, type StudioState } from './Studio'
 import type { BrushSample, Tool } from '../../shared/types'
+import { ColorLoupe } from './ColorLoupe'
+import { ImageEditor } from './ImageEditor'
 
 const PALETTE = [
   ['Ultramarine', '#315d91'], ['Prussian blue', '#244b5a'], ['Cerulean', '#729cae'],
@@ -15,7 +17,10 @@ const TOOLS: { tool: Tool; name: string; key: string; icon: ReactNode }[] = [
   { tool: 'lift', name: 'Lift pigment', key: 'L', icon: <Sparkles /> },
   { tool: 'eraser', name: 'Eraser', key: 'E', icon: <Eraser /> },
   { tool: 'eyedropper', name: 'Pick a color', key: 'I', icon: <Pipette /> },
-  { tool: 'pan', name: 'Move canvas', key: 'H', icon: <Hand /> }
+  { tool: 'pan', name: 'Move canvas', key: 'H', icon: <Hand /> },
+  { tool: 'image-move', name: 'Move image', key: 'V', icon: <Move /> },
+  { tool: 'image-transform', name: 'Transform image', key: 'T', icon: <Scaling /> },
+  { tool: 'image-rotate', name: 'Rotate image', key: 'R', icon: <RotateCw /> }
 ]
 type Modal = 'new' | 'export' | 'help' | null
 interface ImportState { bitmap: ImageBitmap; url: string; name: string; scale: number; x: number; y: number }
@@ -37,9 +42,11 @@ function Slider({ label, value, min = 0, max = 100, suffix = '%', onChange }: { 
 
 export default function App(): ReactNode {
   const canvasRef = useRef<HTMLCanvasElement>(null), stageRef = useRef<HTMLDivElement>(null), studioRef = useRef<Studio | null>(null)
+  const boardRef = useRef<HTMLDivElement>(null)
   const [state, setState] = useState<StudioState | null>(null)
   const [zoom, setZoom] = useState(.5), [pan, setPan] = useState({ x: 0, y: 0 })
   const [cursor, setCursor] = useState<{ x: number; y: number } | null>(null)
+  const [altPick, setAltPick] = useState(false)
   const [menu, setMenu] = useState(false), [modal, setModal] = useState<Modal>(null)
   const [dimensions, setDimensions] = useState({ width: 1536, height: 1024 })
   const [includePaper, setIncludePaper] = useState(true), [hasPainted, setHasPainted] = useState(false)
@@ -59,6 +66,7 @@ export default function App(): ReactNode {
   }
   const safe = (action: Promise<unknown>): void => { void action.catch(error => studioRef.current?.notify(String(error))) }
   const startImport = async (): Promise<void> => {
+    if ((studioRef.current?.state.layers.length ?? 0) >= 8) { studioRef.current?.notify('All eight layers are in use. Remove a layer before importing another image.'); return }
     const file = await window.desktop.importImage()
     if (file.canceled || !file.bytes) return
     const blob = new Blob([file.bytes.slice().buffer as ArrayBuffer]), bitmap = await createImageBitmap(blob)
@@ -100,6 +108,7 @@ export default function App(): ReactNode {
       if (e.target instanceof HTMLElement && (['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target.tagName) || e.target.closest('dialog'))) return
       if (document.querySelector('dialog[open]')) return
       const studio = studioRef.current; if (!studio) return
+      if (e.key === 'Alt') { setAltPick(true); return }
       if (e.code === 'Space') { e.preventDefault(); space.current = true; return }
       if (e.ctrlKey || e.metaKey || e.altKey) return
       const tool = TOOLS.find(t => t.key.toLowerCase() === e.key.toLowerCase())
@@ -110,8 +119,8 @@ export default function App(): ReactNode {
       if (e.key === '?') setModal('help')
       if (e.key === 'Escape') setMenu(false)
     }
-    const up = (e: KeyboardEvent): void => { if (e.code === 'Space') space.current = false }
-    const blur = (): void => { space.current = false; studioRef.current?.endStroke(); gesture.current = null }
+    const up = (e: KeyboardEvent): void => { if (e.code === 'Space') space.current = false; if (e.key === 'Alt') setAltPick(false) }
+    const blur = (): void => { space.current = false; setAltPick(false); studioRef.current?.endStroke(); gesture.current = null }
     window.addEventListener('keydown', down); window.addEventListener('keyup', up); window.addEventListener('blur', blur)
     return () => { window.removeEventListener('keydown', down); window.removeEventListener('keyup', up); window.removeEventListener('blur', blur) }
   }, [])
@@ -131,7 +140,8 @@ export default function App(): ReactNode {
     if (e.button !== 0 && !isPan) return
     const p = point(e)
     if (!isPan && (p.x < 0 || p.y < 0 || p.x >= studio.engine.width || p.y >= studio.engine.height)) return
-    if (brush?.tool === 'eyedropper' && !isPan) { safe(studio.pick(p.x, p.y)); return }
+    if ((brush?.tool === 'eyedropper' || e.altKey) && !isPan) { if (!studio.state.busy) safe(studio.pick(p.x, p.y)); return }
+    if (brush?.tool.startsWith('image-') && !isPan) return
     if (studio.state.busy && !isPan) return
     e.currentTarget.setPointerCapture(e.pointerId)
     gesture.current = { mode: isPan ? 'pan' : 'paint', x: e.clientX, y: e.clientY, px: pan.x, py: pan.y }
@@ -155,14 +165,17 @@ export default function App(): ReactNode {
   const closeImport = (): void => { if (importing) { URL.revokeObjectURL(importing.url); importing.bitmap.close() }; setImporting(null) }
   const commitImport = async (): Promise<void> => {
     if (!importing || !studioRef.current) return
-    const { bitmap, scale, x, y, name } = importing, engine = studioRef.current.engine
-    const canvas = new OffscreenCanvas(engine.width, engine.height)
-    canvas.getContext('2d')!.drawImage(bitmap, x - bitmap.width * scale / 2, y - bitmap.height * scale / 2, bitmap.width * scale, bitmap.height * scale)
+    const { bitmap, scale, x, y, name } = importing
+    const sourceScale = Math.min(1, 2048 / Math.max(bitmap.width, bitmap.height))
+    const canvas = new OffscreenCanvas(Math.max(1, Math.round(bitmap.width * sourceScale)), Math.max(1, Math.round(bitmap.height * sourceScale)))
+    canvas.getContext('2d')!.drawImage(bitmap, 0, 0, canvas.width, canvas.height)
     const png = new Uint8Array(await (await canvas.convertToBlob({ type: 'image/png' })).arrayBuffer())
-    await studioRef.current.importRaster(png, name); setHasPainted(true); closeImport()
+    await studioRef.current.importRaster(png, name, { x, y, width: bitmap.width * scale, height: bitmap.height * scale, rotation: 0, flipX: false, flipY: false }); setHasPainted(true); closeImport()
   }
   const currentColorName = PALETTE.find(p => p[1] === brush?.color)?.[0] ?? 'Your own blend'
-  const paintingTool = brush && !['pan', 'eyedropper'].includes(brush.tool)
+  const picking = brush?.tool === 'eyedropper' || altPick
+  const paintingTool = brush && ['brush', 'water', 'lift', 'eraser'].includes(brush.tool) && !picking
+  const editingImage = brush?.tool.startsWith('image-') && active?.kind === 'raster' && active.transform
 
   return <div className="app-shell">
     <header className="app-header">
@@ -180,24 +193,26 @@ export default function App(): ReactNode {
     </div>
     <main className="workspace">
       <nav className="tool-rail" aria-label="Painting tools"><div className="rail-main">
-        {TOOLS.map(({ tool, name, key, icon }, index) => <div key={tool} className={index === 4 ? 'rail-separated' : ''}><IconButton label={`${name} (${key})`} active={brush?.tool === tool} disabled={!ready} onClick={() => studioRef.current?.selectTool(tool)}>{icon}</IconButton></div>)}
+        {TOOLS.map(({ tool, name, key, icon }, index) => <div key={tool} className={index === 4 || index === 6 ? 'rail-separated' : ''}><IconButton label={`${name} (${key})`} active={brush?.tool === tool} disabled={!ready || state?.busy || (tool.startsWith('image-') && !state?.layers.some(l => l.kind === 'raster'))} onClick={() => studioRef.current?.selectTool(tool)}>{icon}</IconButton></div>)}
         <span className="rail-divider" /><div className="rail-color" title={currentColorName} style={{ backgroundColor: brush?.color }} />
       </div><IconButton label="Fit canvas (Ctrl+0)" onClick={fit}><Expand /></IconButton></nav>
+      {editingImage && active && studioRef.current && <ImageEditor key={active.id} studio={studioRef.current} layer={active} tool={brush!.tool} zoom={zoom} board={boardRef} canvas={canvasRef} busy={!!state?.busy} panKey={space} onCanvasDown={pointerDown} onCanvasMove={pointerMove} onCanvasUp={pointerUp} />}
       <section className="canvas-area">
         <div className="canvas-heading"><span><span className="paper-symbol" />COLD PRESS PAPER <span className="paper-weight">/ 300 GSM</span></span><span className="canvas-heading-right">{state?.paused ? <Pause size={12} /> : <Droplets size={12} />}{state?.paused ? 'Time stands still' : 'Let it flow'}</span></div>
-        <div className={`canvas-stage ${paintingTool ? 'painting-cursor' : ''}`} ref={stageRef} onPointerDown={pointerDown} onPointerMove={pointerMove} onPointerUp={pointerUp} onPointerCancel={pointerUp} onLostPointerCapture={() => { studioRef.current?.endStroke(); gesture.current = null }} onPointerLeave={() => { if (!gesture.current) setCursor(null) }} onContextMenu={e => e.preventDefault()}>
-          <div className="paper-board" style={{ width: state?.width ?? 1536, height: state?.height ?? 1024, transform: `translate(-50%, -50%) translate(${pan.x}px, ${pan.y}px) scale(${zoom})` }}>
+        <div className={`canvas-stage ${paintingTool ? 'painting-cursor' : ''} ${picking ? 'picking-cursor' : ''}`} ref={stageRef} onPointerDown={pointerDown} onPointerMove={pointerMove} onPointerUp={pointerUp} onPointerCancel={pointerUp} onLostPointerCapture={() => { studioRef.current?.endStroke(); gesture.current = null }} onPointerLeave={() => { if (!gesture.current) setCursor(null) }} onContextMenu={e => e.preventDefault()}>
+          <div className="paper-board" ref={boardRef} style={{ width: state?.width ?? 1536, height: state?.height ?? 1024, transform: `translate(-50%, -50%) translate(${pan.x}px, ${pan.y}px) scale(${zoom})` }}>
             <canvas ref={canvasRef} aria-label="Watercolor painting canvas" data-testid="painting-canvas" />
             {!hasPainted && !state?.hasArtwork && ready && !state?.dirty && <div className="empty-paper"><span className="empty-flower">✳</span><p>A blank page.<br />A little possibility.</p><span>Choose a color. Make a mark.</span></div>}
             {cursor && paintingTool && ready && <div className="brush-cursor" style={{ width: brush.size, height: brush.size, left: cursor.x, top: cursor.y, borderWidth: 1 / zoom }} />}
           </div>
+          {picking && cursor && ready && studioRef.current && cursor.x >= 0 && cursor.y >= 0 && cursor.x < state!.width && cursor.y < state!.height && <ColorLoupe studio={studioRef.current} point={cursor} canvas={canvasRef} stage={stageRef} />}
           {!ready && !state?.error && <div className="loading-studio"><Droplets /><span>Preparing the paper…</span></div>}
         </div>
         <footer className="canvas-footer"><div className="paper-info"><span className={`tiny-dot ${state?.paused ? 'paused' : ''}`} />{state?.paused ? 'Drying paused' : (state?.stats.wetLayers ?? 0) > 0 ? 'Paint is settling' : 'Ready for a first wash'}<span className="footer-separator">·</span><span>{state?.layers.length ?? 1} / 8 layers</span></div>
           <div className="zoom-controls"><IconButton label="Zoom out" onClick={() => setZoom(z => Math.max(.1, z / 1.2))}><Minus size={14} /></IconButton><button className="zoom-value" onClick={fit} title="Fit to window">{Math.round(zoom * 100)}%</button><IconButton label="Zoom in" onClick={() => setZoom(z => Math.min(3, z * 1.2))}><Plus size={14} /></IconButton><span className="small-divider" /><IconButton label="Fit to window" onClick={fit}><Expand size={14} /></IconButton></div>
         </footer>
       </section>
-      <aside className="inspector" aria-label="Brush and layer settings">
+      <aside className={`inspector ${editingImage ? 'image-mode' : ''}`} aria-label="Brush and layer settings">
         <section className="inspector-section brush-section"><div className="section-heading"><h2>Your brush</h2><span className="quiet-label">{brush?.tool === 'water' ? 'WATER ONLY' : brush?.tool === 'lift' ? 'LIFTING' : brush?.tool === 'eraser' ? 'ERASING' : 'WATERCOLOR'}</span></div>
           <div className="brush-presets">{(['round', 'wash', 'dry'] as const).map((preset, i) => <button className={`preset ${brush?.preset === preset ? 'selected' : ''}`} key={preset} onClick={() => studioRef.current?.selectPreset(preset)} disabled={!ready} aria-label={`${preset} brush`} aria-pressed={brush?.preset === preset}>
             <svg viewBox="0 0 64 28" aria-hidden="true"><path d={i === 1 ? 'M8 16 Q 22 4 36 13 T 56 12' : 'M9 19 Q24 5 35 14 T56 10'} fill="none" stroke="currentColor" strokeWidth={i === 1 ? 13 : i === 2 ? 6 : 7} strokeLinecap="round" opacity={i === 1 ? '.5' : '.85'} strokeDasharray={i === 2 ? '1 2' : undefined} /></svg><span>{preset === 'dry' ? 'Dry brush' : preset === 'wash' ? 'Wash' : 'Round'}</span>
@@ -207,6 +222,8 @@ export default function App(): ReactNode {
           <Slider label="Water" value={(brush?.water ?? .68) * 100} onChange={water => studioRef.current?.setBrush({ water: water / 100 })} />
           <Slider label="Pigment" value={(brush?.pigment ?? .52) * 100} onChange={pigment => studioRef.current?.setBrush({ pigment: pigment / 100 })} />
           <Slider label="Softness" value={(brush?.softness ?? .72) * 100} onChange={softness => studioRef.current?.setBrush({ softness: softness / 100 })} />
+          <Slider label="Paint spread" min={1} max={8} suffix="×" value={brush?.spread ?? 1} onChange={spread => studioRef.current?.setBrush({ spread })} />
+          <p className="spread-note">1× original flow · 8× stronger flow<br />Applied to the wash on your next stroke.</p>
         </section>
         <section className="inspector-section palette-section"><div className="section-heading"><h2>The palette</h2><span className="quiet-label">12 PIGMENTS</span></div><div className="palette-grid">{PALETTE.map(([name, color]) => <button key={color} title={name} aria-label={name} aria-pressed={brush?.color === color} className={`pigment ${brush?.color === color ? 'chosen' : ''}`} style={{ '--pigment': color } as React.CSSProperties} onClick={() => studioRef.current?.setBrush({ color })}>{brush?.color === color && <Check size={16} />}</button>)}</div>
           <div className="current-pigment"><label className="custom-color" title="Choose a custom color"><input aria-label="Custom pigment color" type="color" value={brush?.color ?? '#315d91'} onChange={e => studioRef.current?.setBrush({ color: e.target.value })} /><span style={{ backgroundColor: brush?.color }} /></label><div><span className="quiet-label">CURRENT PIGMENT</span><strong>{currentColorName}</strong></div><span className="color-hex">{brush?.color.toUpperCase()}</span></div>

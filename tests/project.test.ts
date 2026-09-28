@@ -28,4 +28,13 @@ describe('project persistence', () => {
   it('rejects truncated and unrelated files', () => expect(() => decodeProject(new Uint8Array([1,2,3]))).toThrow())
   it('rejects dimensions beyond the advertised maximum', () => expect(() => decodeProject(tamper(m => m.width = 4096))).toThrow('canvas size'))
   it('requires the selected layer to exist', () => expect(() => decodeProject(tamper(m => m.activeId = 'missing'))).toThrow('active layer'))
+  it('retains stronger spread and accepts older projects without it', () => {
+    const document = sample(); document.layers[0].spread = 8
+    expect(decodeProject(encodeProject(document)).layers[0].spread).toBe(8)
+    expect(decodeProject(encodeProject(sample())).layers[0].spread).toBeUndefined()
+  })
+  it('rejects unsafe spread and malformed transforms', () => {
+    expect(() => decodeProject(tamper(m => m.layers[0].spread = 20))).toThrow('spread')
+    expect(() => decodeProject(tamper(m => m.layers[0].meta.transform = { x: 0 }))).toThrow('transform')
+  })
 })

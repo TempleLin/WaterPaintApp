@@ -1,7 +1,8 @@
 import { WatercolorEngine, type EngineStats } from '../../engine/WatercolorEngine'
 import { StrokeSampler } from '../../engine/stroke'
 import { History } from '../../shared/history'
-import { DEFAULT_BRUSH, type BrushSample, type BrushSettings, type LayerMeta, type Preset, type Tool } from '../../shared/types'
+import { DEFAULT_BRUSH, MAX_LAYERS, type BrushSample, type BrushSettings, type LayerMeta, type Preset, type RasterTransform, type Tool } from '../../shared/types'
+import { validTransform } from '../../shared/transform'
 import { encode, decode } from './codec'
 
 export interface StudioState {
@@ -34,7 +35,12 @@ export class Studio {
   subscribe = (listener: () => void): (() => void) => { this.listeners.add(listener); return () => this.listeners.delete(listener) }
   getSnapshot = (): StudioState => this.state
   private update(patch: Partial<StudioState>): void { this.state = { ...this.state, ...patch }; this.listeners.forEach(fn => fn()) }
-  private sync(): void { this.update({ layers: this.engine.metadata, hasArtwork: this.engine.hasArtwork, canUndo: this.history.canUndo, canRedo: this.history.canRedo, width: this.engine.width, height: this.engine.height, paused: this.engine.paused }) }
+  private sync(): void {
+    const layers = this.engine.metadata
+    const brush = this.state.brush.tool.startsWith('image-') && layers.find(l => l.id === this.state.activeId)?.kind === 'paint'
+      ? { ...this.state.brush, tool: 'brush' as const } : this.state.brush
+    this.update({ layers, brush, hasArtwork: this.engine.hasArtwork, canUndo: this.history.canUndo, canRedo: this.history.canRedo, width: this.engine.width, height: this.engine.height, paused: this.engine.paused })
+  }
   private markDirty(): void { this.revision++; this.update({ dirty: true }); window.desktop.setDirty(true) }
   private clean(): void { this.update({ dirty: false }); window.desktop.setDirty(false) }
   notify(status: string): void { this.update({ status }) }
@@ -86,12 +92,24 @@ export class Studio {
     finally { release(); this.update({ busy: false }); this.engine.render() }
   }
   setBrush(update: Partial<BrushSettings>): void { this.update({ brush: { ...this.state.brush, ...update } }) }
-  selectTool(tool: Tool): void { this.setBrush({ tool }) }
+  selectTool(tool: Tool): void {
+    if (this.state.busy) return
+    if (tool.startsWith('image-') && this.state.layers.find(l => l.id === this.state.activeId)?.kind !== 'raster') {
+      const image = this.state.layers.slice().reverse().find(l => l.kind === 'raster')
+      if (image) this.update({ activeId: image.id })
+      else { this.notify('Import an image to use the image tools.'); return }
+    }
+    this.setBrush({ tool })
+  }
   selectPreset(preset: Preset): void {
     const properties = preset === 'wash' ? { size: 160, water: .92, pigment: .34, softness: .9 } : preset === 'dry' ? { size: 44, water: .09, pigment: .72, softness: .35 } : { size: 70, water: .68, pigment: .52, softness: .72 }
     this.setBrush({ preset, tool: 'brush', ...properties })
   }
-  selectLayer(id: string): void { if (!this.state.busy) this.update({ activeId: id }) }
+  selectLayer(id: string): void {
+    if (this.state.busy) return
+    this.update({ activeId: id })
+    if (this.state.brush.tool.startsWith('image-') && this.state.layers.find(l => l.id === id)?.kind === 'paint') this.selectTool('brush')
+  }
   async addLayer(): Promise<void> { await this.operation('New watercolor layer', () => { const meta = this.engine.addLayer(); this.update({ activeId: meta.id }) }) }
   async deleteLayer(id: string): Promise<void> { await this.operation('Layer removed', () => { this.engine.removeLayer(id); this.update({ activeId: this.engine.metadata.at(-1)!.id }) }) }
   async duplicateLayer(id: string): Promise<void> { await this.operation('Layer duplicated', async () => { const meta = await this.engine.duplicate(id); this.update({ activeId: meta.id }) }) }
@@ -103,7 +121,13 @@ export class Studio {
   beginStroke(sample: BrushSample): void {
     if (this.state.busy || !this.state.ready || this.state.error) return
     const meta = this.state.layers.find(l => l.id === this.state.activeId)
-    if (!meta || meta.locked || !meta.visible || meta.kind !== 'paint') { this.notify('Choose an unlocked, visible watercolor layer to paint.'); return }
+    if (!['brush', 'water', 'lift', 'eraser'].includes(this.state.brush.tool)) return
+    if (!meta || meta.locked || !meta.visible) { this.notify('Choose an unlocked, visible layer to paint.'); return }
+    const above = this.state.layers[this.state.layers.findIndex(l => l.id === meta.id) + 1]
+    const paintAbove = above?.kind === 'paint' && above.visible && !above.locked ? above : null
+    if (meta.kind === 'raster' && !paintAbove && this.state.layers.length >= MAX_LAYERS) {
+      this.notify('All eight layers are in use. Select a watercolor layer or remove a layer to paint above this image.'); return
+    }
     const settings = { ...this.state.brush }
     const stroke: ActiveStroke = { sampler: new StrokeSampler(Math.max(.65, settings.size * .1)), settings, layerId: meta.id, pending: [sample], started: false, ended: false }
     this.stroke = stroke; this.update({ busy: true })
@@ -111,6 +135,14 @@ export class Studio {
       try {
         const snapshot = await this.engine.snapshot(this.state.title, this.state.activeId)
         stroke.checkpoint = encode(snapshot)
+        if (meta.kind === 'raster') {
+          const target = paintAbove ?? this.engine.addLayer({ name: 'Wash over image' })
+          if (!paintAbove) {
+            const imageIndex = this.state.layers.findIndex(l => l.id === meta.id)
+            this.engine.reorderLayer(target.id, imageIndex + 1 - (this.engine.metadata.length - 1))
+          }
+          stroke.layerId = target.id; this.update({ activeId: target.id }); this.sync()
+        }
         stroke.started = true
         // History navigation pauses time; the next mark resumes it.
         if (this.resumeOnStroke) { this.engine.paused = false; this.resumeOnStroke = false; this.sync() }
@@ -193,11 +225,21 @@ export class Studio {
     await this.operation('PNG exported', async () => { const result = await window.desktop.exportPng(await this.engine.exportPNG(paper)); canceled = result.canceled }, false)
     if (canceled) this.notify('Export canceled')
   }
-  async importRaster(png: Uint8Array, name: string): Promise<void> {
+  async importRaster(png: Uint8Array, name: string, transform?: RasterTransform): Promise<void> {
     await this.operation('Image imported', async () => {
-      const layer = this.engine.addLayer({ kind: 'raster', name: name.slice(0, 100) }); await this.engine.setRaster(layer.id, png)
-      this.update({ activeId: layer.id })
+      if (transform && !validTransform(transform)) throw new Error('Invalid image placement.')
+      const layer = this.engine.addLayer({ kind: 'raster', name: name.slice(0, 100), transform }); await this.engine.setRaster(layer.id, png)
+      this.update({ activeId: layer.id, brush: { ...this.state.brush, tool: 'image-transform' } })
     })
+  }
+  async transformRaster(id: string, transform: RasterTransform): Promise<void> {
+    try {
+      const layer = this.state.layers.find(l => l.id === id)
+      if (!layer || layer.kind !== 'raster' || layer.locked || !layer.visible) return
+      if (!validTransform(transform)) { this.notify('Image position or dimensions are outside the supported range.'); return }
+      if (JSON.stringify(layer.transform) === JSON.stringify(transform)) return
+      await this.operation('Image transformed', () => this.engine.updateLayer(id, { transform: { ...transform } }))
+    } finally { this.engine.previewRaster(id) }
   }
   async pick(x: number, y: number): Promise<void> { this.setBrush({ color: await this.engine.sampleColor(x, y), tool: 'brush' }) }
   dispose(): void { if (this.autosave) clearInterval(this.autosave); this.engine.dispose(); this.listeners.clear() }

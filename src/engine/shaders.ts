@@ -81,14 +81,15 @@ fn simulate(@builtin(global_invocation_id) gid: vec3u) {
   var edge = 0.0;
   for (var k = 0u; k < 4u; k++) {
     let nq = vec2i(q) + dirs[k];
-    if (any(nq < vec2i(0)) || any(nq >= vec2i(p.grid.xy))) { continue; }
+    // No flux across the simulated region boundary: never discard transported mass.
+    if (any(nq < vec2i(p.grid.zw)) || any(nq >= vec2i(p.grid.zw + p.region.xy))) { continue; }
     let n = cells[index(vec2u(nq))];
-    let conductance = min(.19, dt * 5.0) * smoothstep(.002, .08, max(c.water.x, n.water.x));
+    let conductance = min(.19, dt * 5.0 * p.paint.x) * smoothstep(.002, .08, max(c.water.x, n.water.x));
     let flux = (n.water.x - c.water.x) * conductance;
     result.water.x += flux;
     let incoming = max(0.0, flux) / max(.001, n.water.x);
     let outgoing = max(0.0, -flux) / max(.001, c.water.x);
-    let diffuse = dt * .85 * smoothstep(.012, .16, min(c.water.x, n.water.x));
+    let diffuse = dt * .85 * p.paint.x * smoothstep(.012, .16, min(c.water.x, n.water.x));
     result.wetA += n.wetA * incoming - c.wetA * outgoing + (n.wetA - c.wetA) * diffuse;
     result.wetB += n.wetB * incoming - c.wetB * outgoing + (n.wetB - c.wetB) * diffuse;
     result.water.y += n.water.y * incoming - c.water.y * outgoing + (n.water.y - c.water.y) * diffuse;
@@ -98,7 +99,7 @@ fn simulate(@builtin(global_invocation_id) gid: vec3u) {
   result.water.w = clamp(c.water.w + absorption - dt * .002, 0.0, 1.0);
   result.water.x = max(0.0, result.water.x - absorption - dt * .026);
   let settling = clamp(dt * (.026 + .032 * tooth + edge * 3.2) +
-    (1.0 - smoothstep(.0, .025, result.water.x)) * .15, 0.0, 1.0);
+    (1.0 - smoothstep(.0, .025, result.water.x)) * (1.0 - pow(.85, dt * 60.0)), 0.0, 1.0);
   result.wetA = max(vec4f(0), result.wetA); result.wetB = max(vec4f(0), result.wetB);
   result.water.y = max(0.0, result.water.y);
   result.dryA += result.wetA * settling; result.dryB += result.wetB * settling;
@@ -177,14 +178,18 @@ export const rasterShader = /* wgsl */ `
 struct Vertex { @builtin(position) pos: vec4f, @location(0) uv: vec2f }
 @group(0) @binding(0) var img: texture_2d<f32>;
 @group(0) @binding(1) var samp: sampler;
-@group(0) @binding(2) var<uniform> opacity: vec4f;
+struct Composite { opacity: vec4f, rowX: vec4f, rowY: vec4f }
+@group(0) @binding(2) var<uniform> p: Composite;
 @vertex fn vert(@builtin(vertex_index) i: u32) -> Vertex {
   let uv = vec2f(f32((i << 1u) & 2u), f32(i & 2u));
   var v: Vertex; v.pos = vec4f(uv * vec2f(2,-2) + vec2f(-1,1),0,1); v.uv = uv; return v;
 }
 @fragment fn frag(v: Vertex) -> @location(0) vec4f {
-  let c = textureSample(img, samp, v.uv); let a = c.a * opacity.x;
-  let premult = select(c.rgb * c.a, c.rgb, opacity.y > .5);
-  return vec4f(premult * opacity.x, a);
+  let uv = vec2f(dot(p.rowX.xyz, vec3f(v.uv, 1)), dot(p.rowY.xyz, vec3f(v.uv, 1)));
+  let c = textureSample(img, samp, uv);
+  let coverage = select(0.0, 1.0, all(uv >= vec2f(0)) && all(uv <= vec2f(1)));
+  let a = c.a * p.opacity.x * coverage;
+  let premult = select(c.rgb * c.a, c.rgb, p.opacity.y > .5);
+  return vec4f(premult * p.opacity.x * coverage, a);
 }
 `
