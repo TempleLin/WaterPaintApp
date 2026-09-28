@@ -170,7 +170,7 @@ fn shade(c: Cell) -> vec4f {
   let q = vec2u(v.uv * p.time.zw);
   let noise = grain(q, p.region.w) - .5;
   let fibers = grain(q / 3u, p.region.w) - .5;
-  return vec4f(vec3f(.986,.978,.956) + noise * .024 + fibers * .012, 1);
+  return vec4f(clamp(p.paint.xyz + (noise * .024 + fibers * .012) * p.paint.w, vec3f(0), vec3f(1)), 1);
 }
 `
 

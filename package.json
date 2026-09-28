@@ -1,6 +1,6 @@
 {
   "name": "waterpaint",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "description": "A quiet studio for living watercolor",
   "author": "WaterPaint",
@@ -13,6 +13,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:electron": "npm run build && node scripts/electron-test.mjs",
+    "test:product": "npm run build && node scripts/product-test.mjs",
     "dist:win": "npm run build && electron-builder --win nsis --x64",
     "check": "npm run typecheck && npm test"
   },

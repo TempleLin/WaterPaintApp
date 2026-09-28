@@ -27,7 +27,7 @@ export function ImageEditor({ studio, layer, tool, zoom, board, canvas, busy, pa
   }
   useEffect(() => {
     const key = (e: KeyboardEvent): void => {
-      if (e.target instanceof HTMLElement && (e.target.closest('input,dialog') || e.ctrlKey || e.metaKey || e.altKey)) return
+      if (e.target instanceof HTMLElement && (e.target.closest('input,select,textarea,button,dialog') || e.ctrlKey || e.metaKey || e.altKey)) return
       if (e.key === 'Escape') { e.preventDefault(); cancel() }
       if (disabled || drag.current) return
       const delta = e.shiftKey ? 10 : 1, offsets: Record<string, [number, number]> = { ArrowLeft: [-delta, 0], ArrowRight: [delta, 0], ArrowUp: [0, -delta], ArrowDown: [0, delta] }

@@ -37,4 +37,11 @@ describe('project persistence', () => {
     expect(() => decodeProject(tamper(m => m.layers[0].spread = 20))).toThrow('spread')
     expect(() => decodeProject(tamper(m => m.layers[0].meta.transform = { x: 0 }))).toThrow('transform')
   })
+  it('retains paper appearance and rejects malformed paper settings', () => {
+    const document = sample(); document.paper = { color: '#eee2c8', grain: 1.7 }
+    expect(decodeProject(encodeProject(document)).paper).toEqual(document.paper)
+    expect(decodeProject(encodeProject(sample())).paper).toBeUndefined()
+    expect(() => decodeProject(tamper(m => m.paper = { color: 'url(invalid)', grain: 1 }))).toThrow('paper')
+    expect(() => decodeProject(tamper(m => m.paper = { color: '#ffffff', grain: -1 }))).toThrow('paper')
+  })
 })

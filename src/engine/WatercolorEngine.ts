@@ -1,5 +1,6 @@
-import type { BrushSample, BrushSettings, DocumentSnapshot, LayerMeta, LayerSnapshot, RasterTransform, Rect } from '../shared/types'
-import { MAX_LAYERS, MAX_SIZE } from '../shared/types'
+import type { BrushSample, BrushSettings, DocumentSnapshot, ExportOptions, LayerMeta, LayerSnapshot, PaperSettings, RasterTransform, Rect } from '../shared/types'
+import { DEFAULT_PAPER, MAX_LAYERS, MAX_SIZE } from '../shared/types'
+import { validPaper } from '../shared/creative'
 import { pigmentKS } from './spectral'
 import { computeShader, rasterShader, renderShader } from './shaders'
 
@@ -49,6 +50,7 @@ export class WatercolorEngine {
   gridWidth = 768; gridHeight = 512
   paused = false
   paper = true
+  paperSettings = { ...DEFAULT_PAPER }
   gpuName = ''
   onError: (message: string) => void = () => {}
   onStats: (stats: EngineStats) => void = () => {}
@@ -111,6 +113,7 @@ export class WatercolorEngine {
     this.layers.forEach(l => this.destroyLayer(l)); this.layers = []
     this.scratch?.destroy()
     this.width = width; this.height = height; this.seed = seed; this.tick = 0
+    this.paperSettings = { ...DEFAULT_PAPER }
     ;[this.gridWidth, this.gridHeight] = simulationSize(width, height)
     this.canvas.width = width; this.canvas.height = height
     this.scratch = this.device.createBuffer({ size: this.byteSize, usage: GPUBufferUsage.STORAGE })
@@ -163,6 +166,12 @@ export class WatercolorEngine {
   removeLayer(id: string): void {
     if (this.layers.length <= 1) throw new Error('Keep at least one layer in the document.')
     this.destroyLayer(this.layer(id)); this.layers = this.layers.filter(l => l.meta.id !== id); this.needsRender = true
+  }
+  clearLayer(id: string): void {
+    const l = this.layer(id)
+    if (l.meta.locked || l.meta.kind !== 'paint') return
+    const encoder = this.device.createCommandEncoder(); encoder.clearBuffer(l.buffer); this.device.queue.submit([encoder.finish()])
+    l.bounds = null; l.wetUntil = 0; l.dirty = true; this.needsRender = true
   }
   private destroyLayer(l: PaintLayer): void { l.buffer.destroy(); l.uniform.destroy(); l.texture.destroy() }
 
@@ -259,7 +268,9 @@ export class WatercolorEngine {
     }
     const view = target ?? this.context.getCurrentTexture().createView()
     const bottom = this.layers[0]
-    this.device.queue.writeBuffer(bottom.uniform, 0, this.params({ x: 0, y: 0, width: this.gridWidth, height: this.gridHeight }))
+    const paperParams = this.params({ x: 0, y: 0, width: this.gridWidth, height: this.gridHeight })
+    new Float32Array(paperParams).set([...this.paperSettings.color.slice(1).match(/../g)!.map(n => parseInt(n, 16) / 255), this.paperSettings.grain], 12)
+    this.device.queue.writeBuffer(bottom.uniform, 0, paperParams)
     const encoder = this.device.createCommandEncoder(), background = encoder.beginRenderPass({ colorAttachments: [{ view, loadOp: 'clear', storeOp: 'store', clearValue: [0,0,0,0] }] })
     if (paper) { background.setPipeline(this.paperPipeline); background.setBindGroup(0, bottom.renderGroup); background.draw(3) }
     background.end(); this.device.queue.submit([encoder.finish()])
@@ -281,6 +292,10 @@ export class WatercolorEngine {
     pass.end(); this.device.queue.submit([e.finish()]); this.needsRender = false
   }
   setPaper(value: boolean): void { this.paper = value; this.needsRender = true }
+  setPaperSettings(value: PaperSettings): void {
+    if (!validPaper(value)) throw new Error('Invalid paper settings.')
+    this.paperSettings = { ...value }; this.needsRender = true
+  }
 
   async snapshot(title: string, activeId: string): Promise<DocumentSnapshot> {
     const release = this.hold()
@@ -298,13 +313,14 @@ export class WatercolorEngine {
         }
         layers.push({ meta: structuredClone(l.meta), bounds: l.bounds ? { ...l.bounds } : null, wetUntil: l.wetUntil, spread: l.spread, state, raster: l.raster?.slice() })
       }
-      return { version: 1, width: this.width, height: this.height, seed: this.seed, tick: this.tick, title, activeId, layers }
+      return { version: 1, width: this.width, height: this.height, seed: this.seed, tick: this.tick, title, activeId, layers, paper: { ...this.paperSettings } }
     } finally { release() }
   }
   async restore(snapshot: DocumentSnapshot): Promise<void> {
     const release = this.hold()
     try {
       this.reset(snapshot.width, snapshot.height, snapshot.seed); this.tick = snapshot.tick
+      this.paperSettings = { ...(snapshot.paper ?? DEFAULT_PAPER) }
       for (const saved of snapshot.layers) {
         this.addLayer(saved.meta)
         const l = this.layer(saved.meta.id); l.bounds = saved.bounds; l.wetUntil = saved.wetUntil; l.spread = saved.spread ?? 1
@@ -329,7 +345,7 @@ export class WatercolorEngine {
     } finally { bitmap.close() }
   }
   async duplicate(id: string): Promise<LayerMeta> {
-    const l = this.layer(id), meta = this.addLayer({ ...l.meta, id: crypto.randomUUID(), name: `${l.meta.name} copy` })
+    const l = this.layer(id), meta = this.addLayer({ ...l.meta, id: crypto.randomUUID(), name: `${l.meta.name.slice(0, 95)} copy` })
     const copy = this.layer(meta.id)
     if (l.meta.kind === 'paint') {
       const e = this.device.createCommandEncoder(); e.copyBufferToBuffer(l.buffer, 0, copy.buffer, 0, this.byteSize); this.device.queue.submit([e.finish()])
@@ -368,6 +384,14 @@ export class WatercolorEngine {
     const pixels = await this.pixels(paper), canvas = new OffscreenCanvas(this.width, this.height)
     canvas.getContext('2d')!.putImageData(new ImageData(pixels, this.width, this.height), 0, 0)
     return new Uint8Array(await (await canvas.convertToBlob({ type: 'image/png' })).arrayBuffer())
+  }
+  async exportImage(options: ExportOptions): Promise<Uint8Array> {
+    if (!['png', 'jpeg'].includes(options.format) || !Number.isFinite(options.scale) || options.scale < .1 || options.scale > 2 || !Number.isFinite(options.quality) || options.quality < .1 || options.quality > 1) throw new Error('Invalid export options.')
+    const source = new OffscreenCanvas(this.width, this.height)
+    source.getContext('2d')!.putImageData(new ImageData(await this.pixels(options.paper || options.format === 'jpeg'), this.width, this.height), 0, 0)
+    const output = new OffscreenCanvas(Math.max(1, Math.round(this.width * options.scale)), Math.max(1, Math.round(this.height * options.scale)))
+    const context = output.getContext('2d')!; context.imageSmoothingQuality = 'high'; context.drawImage(source, 0, 0, output.width, output.height)
+    return new Uint8Array(await (await output.convertToBlob({ type: `image/${options.format}`, quality: options.quality })).arrayBuffer())
   }
   async sampleColor(x: number, y: number): Promise<string> {
     const pixels = await this.pixels(true, { x: Math.max(0, Math.min(this.width - 1, Math.floor(x))), y: Math.max(0, Math.min(this.height - 1, Math.floor(y))), width: 1, height: 1 })

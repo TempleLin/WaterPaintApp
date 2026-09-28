@@ -1,7 +1,9 @@
 import { WatercolorEngine, type EngineStats } from '../../engine/WatercolorEngine'
 import { StrokeSampler } from '../../engine/stroke'
 import { History } from '../../shared/history'
-import { DEFAULT_BRUSH, MAX_LAYERS, type BrushSample, type BrushSettings, type LayerMeta, type Preset, type RasterTransform, type Tool } from '../../shared/types'
+import { DEFAULT_PAPER, MAX_LAYERS, type BrushSample, type BrushSettings, type ExportOptions, type Guide, type LayerMeta, type PaperSettings, type Preset, type RasterTransform, type Symmetry, type Tool } from '../../shared/types'
+import { StrokeSmoother, symmetrySamples } from '../../shared/creative'
+import { loadBrush, writePreference } from './preferences'
 import { validTransform } from '../../shared/transform'
 import { encode, decode } from './codec'
 
@@ -10,8 +12,9 @@ export interface StudioState {
   layers: LayerMeta[]; activeId: string; brush: BrushSettings; paused: boolean;
   canUndo: boolean; canRedo: boolean; width: number; height: number;
   stats: EngineStats; status: string; recovery: Uint8Array | null
+  paper: PaperSettings; symmetry: Symmetry; smoothing: number; guide: Guide; lastSaved: string | null
 }
-interface ActiveStroke { sampler: StrokeSampler; settings: BrushSettings; layerId: string; pending: BrushSample[]; started: boolean; ended: boolean; checkpoint?: Promise<Uint8Array> }
+interface ActiveStroke { sampler: StrokeSampler; smoother: StrokeSmoother; symmetry: Symmetry; settings: BrushSettings; layerId: string; pending: BrushSample[]; started: boolean; ended: boolean; checkpoint?: Promise<Uint8Array> }
 export class Studio {
   engine: WatercolorEngine
   history = new History()
@@ -22,7 +25,8 @@ export class Studio {
   private lastRecoveredRevision = -1
   state: StudioState = {
     ready: false, busy: false, error: null, title: 'Untitled study', dirty: false, hasArtwork: false,
-    layers: [], activeId: '', brush: { ...DEFAULT_BRUSH }, paused: false,
+    layers: [], activeId: '', brush: loadBrush(), paused: false,
+    paper: { ...DEFAULT_PAPER }, symmetry: 'off', smoothing: 0, guide: 'none', lastSaved: null,
     canUndo: false, canRedo: false, width: 1536, height: 1024,
     stats: { fps: 0, frameMs: 0, wetLayers: 0, gpu: '', simulation: '' }, status: 'Preparing your studio…', recovery: null
   }
@@ -39,7 +43,7 @@ export class Studio {
     const layers = this.engine.metadata
     const brush = this.state.brush.tool.startsWith('image-') && layers.find(l => l.id === this.state.activeId)?.kind === 'paint'
       ? { ...this.state.brush, tool: 'brush' as const } : this.state.brush
-    this.update({ layers, brush, hasArtwork: this.engine.hasArtwork, canUndo: this.history.canUndo, canRedo: this.history.canRedo, width: this.engine.width, height: this.engine.height, paused: this.engine.paused })
+    this.update({ layers, brush, paper: { ...this.engine.paperSettings }, hasArtwork: this.engine.hasArtwork, canUndo: this.history.canUndo, canRedo: this.history.canRedo, width: this.engine.width, height: this.engine.height, paused: this.engine.paused })
   }
   private markDirty(): void { this.revision++; this.update({ dirty: true }); window.desktop.setDirty(true) }
   private clean(): void { this.update({ dirty: false }); window.desktop.setDirty(false) }
@@ -59,7 +63,7 @@ export class Studio {
   }
   async bytes(): Promise<Uint8Array> { return encode(await this.engine.snapshot(this.state.title, this.state.activeId)) }
   private async recover(): Promise<void> {
-    if (!this.state.ready || this.state.busy || !this.state.dirty || this.revision === this.lastRecoveredRevision) return
+    if (!this.state.ready || this.state.busy || this.state.recovery || !this.state.dirty || this.revision === this.lastRecoveredRevision) return
     const revision = this.revision
     try { const data = await this.bytes(); await window.desktop.writeRecovery(data); this.lastRecoveredRevision = revision }
     catch (error) { this.notify(`Recovery could not be saved: ${error instanceof Error ? error.message : error}`) }
@@ -91,7 +95,19 @@ export class Studio {
     }
     finally { release(); this.update({ busy: false }); this.engine.render() }
   }
-  setBrush(update: Partial<BrushSettings>): void { this.update({ brush: { ...this.state.brush, ...update } }) }
+  setBrush(update: Partial<BrushSettings>): void {
+    const brush = { ...this.state.brush, ...update }; this.update({ brush }); writePreference('brush', brush)
+  }
+  setCreative(update: Partial<Pick<StudioState, 'symmetry' | 'smoothing' | 'guide'>>): void { this.update(update) }
+  async setPaper(paper: PaperSettings): Promise<void> { await this.operation('Paper updated', () => this.engine.setPaperSettings(paper)) }
+  async rename(title: string): Promise<void> {
+    const name = title.trim().slice(0, 200)
+    if (name && name !== this.state.title) await this.operation('Painting renamed', () => this.update({ title: name }))
+  }
+  async clearLayer(): Promise<void> {
+    const layer = this.state.layers.find(l => l.id === this.state.activeId)
+    if (layer?.kind === 'paint' && !layer.locked) await this.operation('Layer cleared — undo to restore', () => this.engine.clearLayer(layer.id))
+  }
   selectTool(tool: Tool): void {
     if (this.state.busy) return
     if (tool.startsWith('image-') && this.state.layers.find(l => l.id === this.state.activeId)?.kind !== 'raster') {
@@ -129,7 +145,7 @@ export class Studio {
       this.notify('All eight layers are in use. Select a watercolor layer or remove a layer to paint above this image.'); return
     }
     const settings = { ...this.state.brush }
-    const stroke: ActiveStroke = { sampler: new StrokeSampler(Math.max(.65, settings.size * .1)), settings, layerId: meta.id, pending: [sample], started: false, ended: false }
+    const stroke: ActiveStroke = { sampler: new StrokeSampler(Math.max(.65, settings.size * .1)), smoother: new StrokeSmoother(this.state.smoothing * .4), symmetry: this.state.symmetry, settings, layerId: meta.id, pending: [sample], started: false, ended: false }
     this.stroke = stroke; this.update({ busy: true })
     const capture = async (): Promise<void> => {
       try {
@@ -161,7 +177,9 @@ export class Studio {
     stroke.ended = true; if (stroke.started) void this.finishStroke(stroke)
   }
   private consume(stroke: ActiveStroke): void {
-    for (const sample of stroke.pending.splice(0)) for (const dab of stroke.sampler.push(sample)) this.engine.dab(stroke.layerId, dab, stroke.settings)
+    for (const sample of stroke.pending.splice(0)) for (const dab of stroke.sampler.push(stroke.smoother.push(sample))) {
+      for (const copy of symmetrySamples(dab, stroke.symmetry, this.engine.width, this.engine.height)) this.engine.dab(stroke.layerId, copy, stroke.settings)
+    }
   }
   private async finishStroke(stroke: ActiveStroke): Promise<void> {
     try {
@@ -187,7 +205,7 @@ export class Studio {
     await this.operation('A fresh sheet, just for you.', async () => {
       this.engine.reset(width, height); const meta = this.engine.addLayer({ name: 'First wash' })
       this.engine.paused = false; this.history.clear(); this.resumeOnStroke = false
-      this.update({ title: 'Untitled study', activeId: meta.id }); this.clean()
+      this.update({ title: 'Untitled study', activeId: meta.id, lastSaved: null }); this.clean()
       await window.desktop.resetProjectPath(); await window.desktop.clearRecovery()
     }, false)
   }
@@ -195,10 +213,9 @@ export class Studio {
     if (this.state.busy) return false
     let saved = false
     await this.operation('Painting saved', async () => {
-      const result = await window.desktop.saveProject(await this.bytes(), saveAs)
+      const result = await window.desktop.saveProject(await this.bytes(), saveAs, this.state.title)
       if (!result.canceled) {
-        const title = result.path!.split(/[\\/]/).pop()!.replace(/\.waterpaint$/i, '')
-        this.update({ title }); this.clean(); await window.desktop.clearRecovery(); saved = true
+        this.update({ lastSaved: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) }); this.clean(); await window.desktop.clearRecovery(); saved = true
       } else this.notify('Save canceled')
     }, false)
     if (!saved) this.notify('Save canceled')
@@ -210,12 +227,17 @@ export class Studio {
     if (result.canceled || !result.bytes) return
     await this.loadBytes(result.bytes, false, result.path)
   }
+  async openRecent(id: string): Promise<void> {
+    if (this.state.busy) return
+    const result = await window.desktop.openRecent(id)
+    if (!result.canceled && result.bytes) await this.loadBytes(result.bytes, false, result.path)
+  }
   async loadBytes(bytes: Uint8Array, recovery: boolean, path?: string): Promise<void> {
     await this.operation(recovery ? 'Recovered your painting' : 'Painting opened', async () => {
       // Decode and validate fully before replacing the current document.
       const document = await decode(bytes)
       await this.engine.restore(document); this.history.clear(); this.engine.paused = true; this.resumeOnStroke = true
-      this.update({ activeId: document.activeId, title: path ? path.split(/[\\/]/).pop()!.replace(/\.waterpaint$/i, '') : document.title })
+      this.update({ activeId: document.activeId, title: document.title, lastSaved: null })
       if (recovery) { await window.desktop.resetProjectPath(); this.markDirty() }
       else { await window.desktop.adoptOpenedProject(); this.clean(); await window.desktop.clearRecovery() }
     }, false)
@@ -223,6 +245,13 @@ export class Studio {
   async export(paper: boolean): Promise<void> {
     let canceled = false
     await this.operation('PNG exported', async () => { const result = await window.desktop.exportPng(await this.engine.exportPNG(paper)); canceled = result.canceled }, false)
+    if (canceled) this.notify('Export canceled')
+  }
+  async exportWithOptions(options: ExportOptions): Promise<void> {
+    let canceled = false
+    await this.operation(`${options.format.toUpperCase()} exported`, async () => {
+      const result = await window.desktop.exportImage(await this.engine.exportImage(options), options.format, this.state.title); canceled = result.canceled
+    }, false)
     if (canceled) this.notify('Export canceled')
   }
   async importRaster(png: Uint8Array, name: string, transform?: RasterTransform): Promise<void> {

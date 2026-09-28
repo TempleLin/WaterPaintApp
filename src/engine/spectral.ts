@@ -34,6 +34,13 @@ export function reflectance(ks: number): number {
   // Rationalized form avoids catastrophic cancellation for dark pigments.
   return 1 / (1 + ks + Math.sqrt(ks * ks + 2 * ks))
 }
+/** Mix in the same reduced spectral space used by the painting engine. */
+export function mixPigments(a: string, b: string, ratio: number): string {
+  if (ratio <= 0) return a
+  if (ratio >= 1) return b
+  const ka = pigmentKS(a), kb = pigmentKS(b)
+  return '#' + spectralRGB(ka.map((k, i) => k * (1 - ratio) + kb[i] * ratio)).map(c => Math.round(c * 255).toString(16).padStart(2, '0')).join('')
+}
 export function spectralRGB(ks: number[]): number[] {
   const xyz = [0, 0, 0]
   ks.forEach((k, i) => BAND_XYZ[i].forEach((w, c) => { xyz[c] += reflectance(k) * w }))

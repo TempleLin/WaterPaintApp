@@ -2,6 +2,7 @@ import { app, BrowserWindow, dialog, ipcMain, Menu, type IpcMainInvokeEvent } fr
 import { join } from 'node:path'
 import { readFile, writeFile, rename, mkdir, unlink, stat } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
+import type { RecentProject } from '../shared/types'
 
 const MAX_BYTES = 512 * 1024 * 1024
 let window: BrowserWindow | null = null
@@ -26,10 +27,31 @@ async function readLimited(path: string): Promise<Uint8Array> {
   return new Uint8Array(await readFile(path))
 }
 const recoveryPath = (): string => join(app.getPath('userData'), 'recovery.waterpaint')
+function fileName(title: unknown): string {
+  const name = typeof title === 'string' ? title.replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').slice(0, 100).replace(/[. ]+$/g, '') : ''
+  return !name || /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(name) ? 'WaterPaint' : name
+}
 function command(action: string): void { window?.webContents.send('menu:action', action) }
 
 app.whenReady().then(async () => {
   await mkdir(app.getPath('userData'), { recursive: true })
+  const recentPath = join(app.getPath('userData'), 'recent-projects.json')
+  let recent: RecentProject[] = []
+  try {
+    const stored: unknown = JSON.parse(await readFile(recentPath, 'utf8'))
+    if (Array.isArray(stored)) recent = stored.filter((r): r is RecentProject => r && typeof r.id === 'string' && typeof r.path === 'string' && r.path.toLowerCase().endsWith('.waterpaint') && typeof r.name === 'string' && typeof r.openedAt === 'string').slice(0, 10)
+  } catch { /* A missing or damaged recent list must not prevent startup. */ }
+  let recentQueue = Promise.resolve()
+  const persistRecent = (): Promise<void> => {
+    const data = Buffer.from(JSON.stringify(recent))
+    recentQueue = recentQueue.catch(() => {}).then(() => atomicWrite(recentPath, data))
+    return recentQueue
+  }
+  const remember = async (path: string): Promise<void> => {
+    const previous = recent.find(r => r.path.toLowerCase() === path.toLowerCase())
+    recent = [{ id: previous?.id ?? randomUUID(), path, name: path.split(/[\\/]/).pop()!.replace(/\.waterpaint$/i, ''), openedAt: new Date().toISOString() }, ...recent.filter(r => r.path.toLowerCase() !== path.toLowerCase())].slice(0, 10)
+    await persistRecent().catch(() => {}) // Bookkeeping must not turn a completed save into a failure.
+  }
   window = new BrowserWindow({
     width: 1460, height: 980, minWidth: 1024, minHeight: 720, show: false,
     title: 'WaterPaint', backgroundColor: '#efede8', autoHideMenuBar: true,
@@ -68,18 +90,28 @@ app.whenReady().then(async () => {
     const data = await readLimited(result.filePaths[0]); openedPath = result.filePaths[0]
     return { canceled: false, path: openedPath, bytes: data }
   })
-  guarded('project:adopt', () => { projectPath = openedPath; openedPath = undefined })
+  guarded('project:adopt', async () => { projectPath = openedPath; openedPath = undefined; if (projectPath) await remember(projectPath) })
+  guarded('project:recent', () => recent.map(r => ({ ...r })))
+  guarded('project:clear-recent', async () => { recent = []; await persistRecent() })
+  guarded('project:open-recent', async (id: unknown) => {
+    const selected = recent.find(r => r.id === id)
+    if (!selected) throw new Error('This painting is no longer in the recent list.')
+    try {
+      const data = await readLimited(selected.path); openedPath = selected.path
+      return { canceled: false, path: selected.path, bytes: data }
+    } catch { throw new Error('This painting could not be opened. It may have moved or been deleted. Use Open painting to locate it.') }
+  })
   guarded('project:reset', () => { projectPath = undefined; openedPath = undefined })
-  guarded('project:save', async (input: unknown, saveAs: unknown) => {
+  guarded('project:save', async (input: unknown, saveAs: unknown, title: unknown) => {
     const data = bytes(input)
     let target = projectPath
     if (!target || saveAs === true) {
-      const result = await dialog.showSaveDialog(window!, { title: 'Save painting', defaultPath: projectPath ?? 'Untitled.waterpaint', filters: [{ name: 'WaterPaint artwork', extensions: ['waterpaint'] }] })
+      const result = await dialog.showSaveDialog(window!, { title: 'Save painting', defaultPath: projectPath ?? `${fileName(title)}.waterpaint`, filters: [{ name: 'WaterPaint artwork', extensions: ['waterpaint'] }] })
       if (result.canceled || !result.filePath) { closeAfterSave = false; return { canceled: true } }
       target = result.filePath
       if (!target.toLowerCase().endsWith('.waterpaint')) target += '.waterpaint'
     }
-    try { await atomicWrite(target, data); projectPath = target; return { canceled: false, path: target } }
+    try { await atomicWrite(target, data); projectPath = target; await remember(target); return { canceled: false, path: target } }
     catch (error) { closeAfterSave = false; throw error }
   })
   guarded('image:import', async () => {
@@ -92,6 +124,16 @@ app.whenReady().then(async () => {
     const result = await dialog.showSaveDialog(window!, { title: 'Export PNG', defaultPath: 'WaterPaint.png', filters: [{ name: 'PNG image', extensions: ['png'] }] })
     if (result.canceled || !result.filePath) return { canceled: true }
     const target = result.filePath.toLowerCase().endsWith('.png') ? result.filePath : result.filePath + '.png'
+    await atomicWrite(target, data); return { canceled: false, path: target }
+  })
+  guarded('image:export-options', async (input: unknown, format: unknown, title: unknown) => {
+    const data = bytes(input)
+    if (format !== 'png' && format !== 'jpeg') throw new Error('Unsupported image format.')
+    const extension = format === 'jpeg' ? 'jpg' : 'png'
+    const name = fileName(title)
+    const result = await dialog.showSaveDialog(window!, { title: `Export ${format.toUpperCase()}`, defaultPath: `${name || 'WaterPaint'}.${extension}`, filters: [{ name: `${format.toUpperCase()} image`, extensions: [extension] }] })
+    if (result.canceled || !result.filePath) return { canceled: true }
+    const target = result.filePath.toLowerCase().endsWith(`.${extension}`) ? result.filePath : `${result.filePath}.${extension}`
     await atomicWrite(target, data); return { canceled: false, path: target }
   })
   let recoveryQueue = Promise.resolve()

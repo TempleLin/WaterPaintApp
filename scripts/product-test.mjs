@@ -1,0 +1,140 @@
+import { _electron as electron } from '@playwright/test'
+import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import path from 'node:path'
+import assert from 'node:assert/strict'
+
+await mkdir('test-results', { recursive: true })
+const report = { checks: [] }, check = (name, condition, details) => {
+  assert.ok(condition, `${name}: ${JSON.stringify(details)}`)
+  report.checks.push({ name, passed: true, details }); console.log(`PASS ${name}`)
+}
+let app
+try {
+  const env = { ...process.env, WATERPAINT_TEST: '1' }; delete env.ELECTRON_RUN_AS_NODE
+  app = await electron.launch({ args: ['.'], env, timeout: 90000 })
+  const page = await app.firstWindow(); page.setDefaultTimeout(45000)
+  const errors = []; page.on('pageerror', error => errors.push(error.message))
+  await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].webContents.setBackgroundThrottling(false))
+  await page.waitForFunction(() => window.__waterpaint?.state.ready)
+  await page.evaluate(async () => { const s = window.__waterpaint; await s.recoveryAction(false); await s.newDocument(400, 400); s.engine.paused = true; localStorage.removeItem('waterpaint.library') })
+  await page.getByRole('button', { name: 'Studio kit', exact: true }).first().click()
+  await page.getByLabel('First mixing color').fill('#f5d62a')
+  await page.getByLabel('Second mixing color').fill('#2461b0')
+  await page.getByRole('button', { name: 'Paint with mix' }).click()
+  const mixed = await page.evaluate(() => window.__waterpaint.state.brush.color)
+  const rgb = mixed.slice(1).match(/../g).map(v => parseInt(v, 16))
+  check('Pigment mixer creates a usable green brush color', rgb[1] > rgb[0] && rgb[1] > rgb[2], mixed)
+  await page.getByRole('button', { name: 'Save mixed color' }).click()
+  await page.locator('summary').filter({ hasText: 'My brushes' }).click()
+  await page.getByRole('textbox', { name: 'Brush preset name' }).fill('Forest detail')
+  await page.getByRole('button', { name: 'Save current brush' }).click()
+  await page.getByRole('button', { name: /^Forest detail/ }).click()
+  check('Personal brushes retain named settings', await page.evaluate(() => JSON.parse(localStorage.getItem('waterpaint.library')).brushes[0].name === 'Forest detail'))
+  await page.locator('summary').filter({ hasText: 'Drawing companions' }).click()
+  await page.getByLabel('Stroke symmetry').selectOption('quad')
+  await page.getByLabel('Stroke smoothing').fill('25')
+  await page.getByLabel('Composition guide').selectOption('thirds')
+  check('Drawing companions are wired to studio state', await page.evaluate(() => {
+    const s = window.__waterpaint.state; return s.symmetry === 'quad' && s.smoothing === 25 && s.guide === 'thirds'
+  }))
+  const mirrored = await page.evaluate(async () => {
+    const s = window.__waterpaint; s.setCreative({ smoothing: 0 }); s.setBrush({ size: 24, water: .7, pigment: .8, tool: 'brush' })
+    s.beginStroke({ x: 90, y: 100, pressure: 1 }); s.moveStroke({ x: 130, y: 100, pressure: 1 }); s.endStroke()
+    while (s.state.busy) await new Promise(r => setTimeout(r, 20))
+    const pixels = await s.engine.pixels(false)
+    const alpha = (x, y) => pixels[(y * 400 + x) * 4 + 3]
+    const corners = [[90,100], [310,100], [90,300], [310,300]].map(([x,y]) => alpha(x,y))
+    await s.travel(false); const undone = !s.engine.hasArtwork; await s.travel(true)
+    return { corners, undone, restored: s.engine.hasArtwork }
+  })
+  check('Four-way painting deposits four marks in one undo step', mirrored.corners.every(a => a > 0) && mirrored.undone && mirrored.restored, mirrored)
+  await page.locator('summary').filter({ hasText: 'Paper & surface' }).click()
+  await page.getByRole('button', { name: 'Sand paper', exact: true }).click()
+  await page.waitForFunction(() => !window.__waterpaint.state.busy)
+  const paper = await page.evaluate(async () => {
+    const s = window.__waterpaint, first = Array.from((await s.engine.pixels(true)).slice(0, 4)), data = await s.bytes()
+    await s.newDocument(64,64); await s.loadBytes(data, true)
+    const same = Array.from((await s.engine.pixels(true)).slice(0, 4))
+    return { color: s.state.paper.color, first, same }
+  })
+  check('Paper tone survives project reload and affects rendered pixels', paper.color === '#eee2c8' && paper.first.join() === paper.same.join() && paper.first[0] > paper.first[2], paper)
+  await page.getByRole('button', { name: 'Rename painting', exact: true }).click()
+  await page.getByRole('textbox', { name: 'Painting name' }).fill('Forest reflections')
+  await page.getByRole('dialog').getByRole('button', { name: 'Rename painting', exact: true }).click()
+  await page.waitForFunction(() => !window.__waterpaint.state.busy)
+  const projectPath = path.resolve('test-results/product-study.waterpaint'), jpegPath = path.resolve('test-results/product-export.jpg'), pngPath = path.resolve('test-results/product-export.png')
+  await app.evaluate(({ dialog }, target) => { dialog.showSaveDialog = async () => ({ canceled: false, filePath: target }) }, projectPath)
+  await page.getByRole('button', { name: 'Save', exact: true }).click()
+  await page.waitForFunction(() => !window.__waterpaint.state.busy && !window.__waterpaint.state.dirty)
+  const recent = await page.evaluate(() => window.desktop.recentProjects())
+  check('Successful native saves populate recent projects', recent[0].path === projectPath, recent[0])
+  const unknownRejected = await page.evaluate(async () => { try { await window.desktop.openRecent('unknown'); return false } catch { return true } })
+  check('Recent-project IPC rejects arbitrary IDs', unknownRejected)
+  await page.getByRole('button', { name: 'File', exact: true }).click()
+  await page.getByRole('button', { name: 'Recent paintings…', exact: true }).click()
+  await page.getByRole('button', { name: /product-study/ }).click()
+  await page.waitForFunction(() => !window.__waterpaint.state.busy && window.__waterpaint.state.title === 'Forest reflections')
+  check('Recent-project picker reopens the saved document title', true)
+  await page.getByRole('button', { name: 'Export', exact: true }).click()
+  await page.getByLabel('Export format').selectOption('jpeg')
+  await page.getByLabel('Export size').selectOption('0.5')
+  await page.getByLabel('JPEG quality').fill('85')
+  await page.waitForFunction(() => !document.querySelector('.real-export-preview > span'))
+  check('Export previews the painting with selected settings', await page.getByRole('img', { name: 'Preview of the exported painting' }).isVisible())
+  await page.screenshot({ path: 'test-results/product-export-dialog.png' })
+  await app.evaluate(({ dialog }, target) => { dialog.showSaveDialog = async () => ({ canceled: false, filePath: target }) }, jpegPath)
+  await page.getByRole('button', { name: 'Export painting', exact: true }).click()
+  await page.waitForFunction(() => !window.__waterpaint.state.busy && window.__waterpaint.state.status === 'JPEG exported')
+  const jpeg = await readFile(jpegPath)
+  check('JPEG export writes a real JPEG file', jpeg[0] === 255 && jpeg[1] === 216)
+  const sizes = await page.evaluate(async () => {
+    const s = window.__waterpaint, jpg = await s.engine.exportImage({ format: 'jpeg', paper: false, scale: .5, quality: .85 }), png = await s.engine.exportImage({ format: 'png', paper: false, scale: 2, quality: 1 })
+    const j = await createImageBitmap(new Blob([jpg])), p = await createImageBitmap(new Blob([png]))
+    const c = new OffscreenCanvas(p.width,p.height); c.getContext('2d').drawImage(p,0,0)
+    const result = { jpeg: [j.width,j.height], png: [p.width,p.height], alpha: c.getContext('2d').getImageData(0,0,1,1).data[3] }; j.close(); p.close(); return result
+  })
+  check('Export resizing and transparent PNG alpha are correct', sizes.jpeg[0] === 200 && sizes.png[0] === 800 && sizes.alpha === 0, sizes)
+  await app.evaluate(({ dialog }, target) => { dialog.showSaveDialog = async () => ({ canceled: false, filePath: target }) }, pngPath)
+  await page.evaluate(async () => window.__waterpaint.export(false))
+  await app.evaluate(({ dialog }, target) => { dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [target] }) }, pngPath)
+  const beforeReference = await page.evaluate(async () => Array.from(await window.__waterpaint.engine.pixels(false)))
+  await page.getByRole('button', { name: 'Reference', exact: true }).click()
+  await page.getByRole('complementary', { name: 'Reference board' }).waitFor()
+  await page.getByRole('button', { name: /Reference pigment/ }).first().click()
+  const reference = await page.evaluate(async () => ({ layers: window.__waterpaint.state.layers.length, pixels: Array.from(await window.__waterpaint.engine.pixels(false)), color: window.__waterpaint.state.brush.color }))
+  check('Reference palettes are pickable and do not alter document pixels or layers', reference.layers === 1 && reference.pixels.every((v, i) => v === beforeReference[i]), reference.color)
+  const refBefore = await page.getByRole('complementary', { name: 'Reference board' }).boundingBox()
+  await page.getByRole('button', { name: 'Move reference board' }).focus(); await page.keyboard.press('ArrowLeft')
+  const refAfter = await page.getByRole('complementary', { name: 'Reference board' }).boundingBox()
+  check('Reference can move out of the way with keyboard controls', refAfter.x < refBefore.x)
+  await page.getByRole('button', { name: 'Minimize reference' }).click()
+  check('Reference can collapse without losing its image', !(await page.getByLabel('Reference image; enable color picker then click to sample').isVisible()))
+  await page.getByRole('button', { name: 'Expand reference' }).click()
+  await page.locator('.inspector').evaluate(el => el.scrollTop = 0)
+  await page.screenshot({ path: 'test-results/product-studio-kit.png' })
+  await page.getByRole('button', { name: 'Focus mode (Tab)', exact: true }).click()
+  check('Focus mode hides the inspector', !(await page.getByRole('complementary', { name: 'Brush and layer settings' }).isVisible()))
+  await page.keyboard.press('Escape')
+  check('Escape restores the workspace', await page.getByRole('complementary', { name: 'Brush and layer settings' }).isVisible())
+  await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].setSize(1024,720))
+  await page.screenshot({ path: 'test-results/product-compact.png' })
+  check('Minimum window width has no page overflow', await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth))
+  const cleared = await page.evaluate(async () => {
+    const s = window.__waterpaint; await s.clearLayer(); const blank = !s.engine.hasArtwork; await s.travel(false); return blank && s.engine.hasArtwork
+  })
+  check('Clear wash is fully undoable', cleared)
+  await page.evaluate(async () => { await window.desktop.clearRecovery(); window.desktop.setDirty(false) })
+  await page.reload(); await page.waitForFunction(() => window.__waterpaint?.state.ready)
+  await page.getByRole('button', { name: 'Studio kit', exact: true }).first().click()
+  await page.locator('summary').filter({ hasText: 'My brushes' }).click()
+  check('Brush and color collection survives reload', await page.getByRole('button', { name: /^Forest detail/ }).isVisible() && await page.evaluate(() => JSON.parse(localStorage.getItem('waterpaint.library')).swatches.length === 1))
+  await page.evaluate(async () => window.desktop.clearRecent())
+  check('Clearing recents does not delete project files', (await readFile(projectPath)).length > 0 && (await page.evaluate(() => window.desktop.recentProjects())).length === 0)
+  check('No new renderer or GPU errors', errors.length === 0 && !(await page.evaluate(() => window.__waterpaint.state.error)), errors)
+} catch (error) {
+  report.error = error.stack || String(error); console.error(error); process.exitCode = 1
+  if (app) { try { await (await app.firstWindow()).screenshot({ path: 'test-results/product-failure.png' }) } catch {} }
+} finally {
+  await writeFile('test-results/product-report.json', JSON.stringify(report, null, 2))
+  if (app) { try { await app.evaluate(({ app }) => app.exit(0)) } catch {} }
+}

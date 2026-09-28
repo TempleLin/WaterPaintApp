@@ -2,6 +2,7 @@ import { zipSync, unzipSync, strToU8, strFromU8 } from 'fflate'
 import type { DocumentSnapshot, LayerSnapshot, Rect } from './types'
 import { MAX_LAYERS, MAX_SIZE } from './types'
 import { validTransform } from './transform'
+import { validPaper } from './creative'
 
 const CELL_BYTES = 80
 export const MAX_PROJECT_BYTES = 512 * 1024 * 1024
@@ -35,6 +36,7 @@ export function decodeProject(bytes: Uint8Array): DocumentSnapshot {
   check(integer(manifest.width, 64, MAX_SIZE) && integer(manifest.height, 64, MAX_SIZE), 'unsupported canvas size.')
   check(integer(manifest.seed, 0, 0xffffffff) && integer(manifest.tick, 0, Number.MAX_SAFE_INTEGER), 'invalid simulation state.')
   check(typeof manifest.title === 'string' && manifest.title.length <= 200, 'invalid document title.')
+  check(manifest.paper === undefined || validPaper(manifest.paper), 'invalid paper settings.')
   check(Array.isArray(manifest.layers) && manifest.layers.length > 0 && manifest.layers.length <= MAX_LAYERS, 'invalid layer count.')
   const ratio = Math.min(1, 1024 / Math.max(manifest.width, manifest.height))
   const gw = Math.ceil(manifest.width * ratio), gh = Math.ceil(manifest.height * ratio)
@@ -67,5 +69,5 @@ export function decodeProject(bytes: Uint8Array): DocumentSnapshot {
     return { meta: { ...m }, state, bounds: b, wetUntil: layer.wetUntil, ...(layer.spread === undefined ? {} : { spread: layer.spread }), raster }
   })
   check(ids.has(manifest.activeId), 'missing active layer.')
-  return { version: 1, width: manifest.width, height: manifest.height, seed: manifest.seed, tick: manifest.tick, title: manifest.title, activeId: manifest.activeId, layers }
+  return { version: 1, width: manifest.width, height: manifest.height, seed: manifest.seed, tick: manifest.tick, title: manifest.title, activeId: manifest.activeId, layers, ...(manifest.paper ? { paper: { ...manifest.paper } } : {}) }
 }
